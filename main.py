@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 import csv
 import gc
+import shutil
 import pandas as pd
 from collections import defaultdict
 from typing import Optional, Dict, Any, List
@@ -197,16 +198,15 @@ YOLO_MODEL_PATH  = r"D:\хакатон\datasets\best.pt"
 ESRGAN_MODEL_PATH = "RealESRGAN_x4plus.pth"
 ESRGAN_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 
-YANDEX_API_KEY   = "YANDEX_API_KEy"
-YANDEX_FOLDER_ID = "YANDEX_FOLDER_ID"
+YANDEX_API_KEY   = "AQVN01X7SsqPYYWmaN-wO2fCpKlenaLVQPIv1twc"
+YANDEX_FOLDER_ID = "b1g1f5c07ffpj7v067d0"
 YANDEX_OCR_URL   = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 
 APPLY_DB_MATCH   = True
-TARGET_FPS       = 5.0
+TARGET_FPS       = 5.0          # обрабатываем ~5 кадров в секунду
 CONF_THRESHOLD   = 0.25
 ROTATE           = True
 DETECTION_SCALE  = 1.0
-DISPLAY_SCALE    = 0.25
 SAVE_SCALE       = 1.0
 APPLY_DENOISE    = True
 APPLY_CONTRAST   = True
@@ -425,6 +425,22 @@ def save_results_csv(all_results: List[dict], csv_path: str):
             writer.writerow(row)
     print(f"✅ CSV сохранён: {csv_path}")
 
+def cleanup_temp_files(keep_csv: str):
+    """Удаляет все файлы в OUTPUT_DIR и IMPROVED_ROI_DIR, кроме указанного CSV."""
+    for folder in [OUTPUT_DIR, IMPROVED_ROI_DIR]:
+        if not os.path.exists(folder):
+            continue
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            if os.path.isfile(file_path):
+                if keep_csv and file_path == keep_csv:
+                    continue
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    print(f"⚠️ Не удалось удалить {file_path}: {e}")
+    print("🧹 Временные файлы (кадры, ROI, JSON) удалены. Оставлен только CSV с результатами.")
+
 # ------------------------------------------------------------
 # ИНИЦИАЛИЗАЦИЯ
 # ------------------------------------------------------------
@@ -456,7 +472,7 @@ track_history = defaultdict(list)
 track_last_seen = {}
 
 # ------------------------------------------------------------
-# ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ ВИДЕО
+# ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ ВИДЕО (только TARGET_FPS кадров в секунду, без видеоряда)
 # ------------------------------------------------------------
 cap = cv2.VideoCapture(VIDEO_PATH)
 if not cap.isOpened():
@@ -464,7 +480,7 @@ if not cap.isOpened():
 
 fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
 frame_step = max(1, round(fps_video / TARGET_FPS))
-print(f"🎬 FPS видео: {fps_video:.2f} → обрабатываем каждый {frame_step}-й кадр")
+print(f"🎬 FPS видео: {fps_video:.2f} → обрабатываем каждый {frame_step}-й кадр (~{TARGET_FPS} FPS)")
 
 frame_num = 0
 saved_frames = 0
@@ -474,25 +490,28 @@ while cap.isOpened():
     if not ret:
         break
     frame_num += 1
+
     if ROTATE:
         frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
+    # Пропускаем кадры, не попадающие в целевой FPS
+    if frame_num % frame_step != 0:
+        continue
+
+    # --- Обработка целевого кадра ---
     det_frame = resize_frame(frame, DETECTION_SCALE)
     results = yolo.track(det_frame, conf=CONF_THRESHOLD, iou=0.5, persist=True, verbose=False)
 
+    # Сохраняем полный кадр с разметкой
     annotated = results[0].plot()
-    cv2.imshow("Детектор ценников", resize_frame(annotated, DISPLAY_SCALE))
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-    if frame_num % frame_step == 0:
-        out_frame = enhance_full_frame(annotated)
-        out_frame = resize_frame(out_frame, SAVE_SCALE)
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f"frame_{frame_num:06d}.jpg"), out_frame)
-        saved_frames += 1
+    out_frame = enhance_full_frame(annotated)
+    out_frame = resize_frame(out_frame, SAVE_SCALE)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"frame_{frame_num:06d}.jpg"), out_frame)
+    saved_frames += 1
 
     boxes = results[0].boxes
     if boxes is None or boxes.id is None:
+        # Если объектов нет, проверяем таймауты треков
         to_remove = [tid for tid, last in track_last_seen.items() if (frame_num - last) > TRACK_TIMEOUT]
         for tid in to_remove:
             final = aggregate_track_results(tid, track_history.get(tid, []))
@@ -534,6 +553,7 @@ while cap.isOpened():
                 track_history[track_id].append(parsed)
         track_last_seen[track_id] = frame_num
 
+    # Удаляем треки, которые не встретились в текущем кадре и истек таймаут
     to_remove = [tid for tid in track_last_seen if tid not in current_ids and (frame_num - track_last_seen[tid]) > TRACK_TIMEOUT]
     for tid in to_remove:
         final = aggregate_track_results(tid, track_history.get(tid, []))
@@ -548,7 +568,6 @@ while cap.isOpened():
         gc.collect()
 
 cap.release()
-cv2.destroyAllWindows()
 gc.collect()
 
 # ------------------------------------------------------------
@@ -594,3 +613,11 @@ else:
     print("Нет результатов для сохранения.")
 
 print(f"\n✅ Готово! Обработано кадров: {frame_num}, сохранено полных кадров: {saved_frames}")
+
+# ------------------------------------------------------------
+# ОЧИСТКА ВРЕМЕННЫХ ФАЙЛОВ (оставляем только CSV)
+# ------------------------------------------------------------
+csv_file_to_keep = os.path.join(OUTPUT_DIR, "final_results.csv") if final_results else None
+cleanup_temp_files(keep_csv=csv_file_to_keep)
+
+print("🎉 Программа завершена. Все временные файлы удалены, CSV с результатами сохранён.")
